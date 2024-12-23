@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP Wi-Fi Manager</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" type="text/css" href="style.css">
+</head>
+<body>
+  <div class="topnav">
+    <h1>ESP Wi-Fi Manager WeatherNode%NODE_ID%</h1>
+  </div>
+  <div class="content">
+    <div class="card-grid">
+      <div class="card">
+        <form action="/" method="POST">
+          <p>
+            <table>
+              <tr>
+                <td>
+                  <label for="ssid">SSID</label>
+                </td>
+                <td>
+                  <input type="text" id ="ssid" name="ssid" value="%SSID%"><br>
+                </td>
+              </tr>
+              <tr>
+                <td>
+                  <label for="pass">Password</label>
+                </td>
+                <td>
+                  <input type="text" id ="pass" name="pass" value="%PASS%"><br>
+                </td>
+              </tr>
+              <tr>
+                <td>
+                  <label for="mqttserver">MQTT Server</label>
+                </td>
+                <td>
+                  <input type="text" id ="mqttserver" name="mqttserver" value="%MQTTSERVER%"><br>
+                </td>
+              </tr>
+              <tr>
+                <td>
+                  <label for="nodeid">Node ID</label>
+                </td>
+                <td>
+                  <input type="text" id ="nodeid" name="nodeid" value="%NODEID%"><br>
+                </td>
+              </tr>
+              <tr>
+                <td>
+                  <label for="adccorrection">ADC Correction</label>
+                </td>
+                <td>
+                  <input type="text" id ="adccorrection" name="adccorrection" value="%ADCCORRECTION%"><br>
+                </td>
+              </tr>
+              <tr>
+                <td>
+                  <label for="tempcorrection">Temperature Correction</label>
+                </td>
+                <td>
+                  <input type="text" id ="tempcorrection" name="tempcorrection" value="%TEMPCORRECTION%"><br>
+                </td>
+              </tr>
+              <tr>
+                <td>
+                  <label for="sleepduration">Sleep duration (seconds)</label>
+                </td>
+                <td>
+                  <input type="number" id ="sleepduration" name="sleepduration" value="%SLEEPDURATION%"><br>
+                </td>
+              </tr>
+            </table>
+            <input type ="submit" value ="Submit">
+          </p>
+        </form>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
