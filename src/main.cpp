@@ -1,50 +1,30 @@
 #include <Arduino.h>
-//
-//
-//
-//
-//
-//
-// add MAX17048 batter fuel gauge sensor for 
-// precise batter measurement
-//
-//
-//
-//
-//
-//
-//
-//
-
-
+#include <DNSServer.h>
+const byte DNS_PORT = 53;
+DNSServer dnsServer;
 
 //#define DEBUG
 #define DO_DEEPSLEEP
 #define DO_PUBLISH
 #ifdef DO_PUBLISH
-#ifdef DEBUG
-#define DEEPSLEEPDURATION 10*1000*1000 // 10 seconds
+  #ifdef DEBUG
+    #define DEEPSLEEPDURATION 10*1000*1000 // 10 seconds
+  #else
+    #define DEEPSLEEPDURATION 15*60*1000*1000 // 15 minutes
+  #endif
 #else
-#define DEEPSLEEPDURATION 15*60*1000*1000 // 15 minutes
+  #define DEEPSLEEPDURATION 5*1000*1000 // 5 seconds
 #endif
-#else
-#define DEEPSLEEPDURATION 5*1000*1000 // 5 seconds
-#endif
-#define REBOOTDURATION 5*1000*1000
 
 bool do_publish = true;
 bool bmp_init = false;
 bool max_init = false;
-bool ina_init = false;
 
 #ifdef ESP32
   #include <ESPAsyncWebServer.h>
   #define MANAGER_PIN 23
-  #define RESET_PIN   19
-  #define ADC_PIN A0
-  #define ADC_RESOLUTION 4096.0
-  #define ADC_MAX_VOLTAGE 3.3
-  #define U_DEVIDER 2.0
+  #define PUBLISH_PIN   19
+  #define CHARGE_PIN  13
 #elif defined( ESP8266 )
   // Including the ESP8266 WiFi library
   #include <ESP8266WiFi.h>
@@ -56,16 +36,17 @@ bool ina_init = false;
     #include "user_interface.h"
   }
   #define MANAGER_PIN 14
-  #define RESET_PIN   12
-  #define ADC_PIN A0
-  #define ADC_RESOLUTION 1024.0
-  #define ADC_MAX_VOLTAGE 4.1
-  #define U_DEVIDER 4.1 //5.05
+  #define PUBLISH_PIN   12
+  #define CHARGE_PIN  13
+  
 #endif
 
 #include "FS.h"
 #include <LittleFS.h>
 
+#include <ESPAsyncHTTPUpdateServer.h>
+
+ESPAsyncHTTPUpdateServer updateServer;
 AsyncWebServer server(80);
 
 #include <Wire.h>
@@ -74,15 +55,15 @@ Adafruit_BME280 bmp;
 
 #include <SparkFun_MAX1704x_Fuel_Gauge_Arduino_Library.h>
 SFE_MAX1704X fuelGauge(MAX1704X_MAX17048);
-#define MAX1704x
 
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include <time.h>
+
 time_t now;
 
 // Define NTP Client to get time
-const char* ntpServer = "pool.ntp.org";
+const char* ntpServer = "ntp1.t-online.de"; //"pool.ntp.org";
 const long  gmtOffset_sec = 3600;
 const int   daylightOffset_sec = 3600;
 
@@ -94,9 +75,9 @@ const char* ssidPath  = "/ssid.txt";
 const char* passPath  = "/pass.txt";
 const char* mqttPath  = "/mqtt.txt";
 const char* idPath    = "/id.txt";
-const char* adcPath   = "/adc.txt";
 const char* sleepPath = "/sleep.txt";
 const char* tempPath  = "/temp.txt";
+const char* timePath  = "/time.txt";
 
 // Replace with your network details
 //Variables to save values from HTML form
@@ -104,15 +85,15 @@ String ssid = "";
 String pass;
 String ip;
 String mqtt_server = "hap-nodejs";
-float_t adcCorrection = 2.6;
-float_t tempCorrection = -1.5;
 const char* mqtt_topic = WEATHERNODE;
 int nodeId = 0;
 int sleepDuration = DEEPSLEEPDURATION;
+String myTimeZone = "CET";
+float tempCorrection = 0.0;
 
 long lastMsg = 0;
 int value = 0;
-char json[512];
+char json[600];
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -153,6 +134,27 @@ void i2cScanner() {
   else {
     Serial.println("\ndone\n");
   }
+}
+
+bool getWiFiManager() {
+  if( digitalRead(MANAGER_PIN) == 0 ) {
+    return true;
+  }
+  return false;
+}
+
+bool getPublish() {
+  if( digitalRead(PUBLISH_PIN) == 0 ) {
+    return true;
+  }
+  return false;
+}
+
+bool isCharging() {
+  Serial.printf("isCharging(): CHARGE_PIN: %d MAX Changerate: %f\n", digitalRead(CHARGE_PIN), fuelGauge.getChangeRate());
+  if( digitalRead(CHARGE_PIN) == 0 )
+    return true;
+  return false;
 }
 
 float convertCtoF(float c) {
@@ -232,27 +234,21 @@ float mapfloat(float x, float in_min, float in_max, float out_min, float out_max
 float getVoltage() {
   Serial.println("getVoltage()");
   float busvoltage;
-  #ifndef MAX1704x
-    int rawVoltage = analogRead(ADC_PIN);
-    Serial.printf("rawVoltage:     %d\n", rawVoltage);
-    #ifdef DEBUG
-    Serial.printf("ADC_MAX_VOLTAGE: %f\n", ADC_MAX_VOLTAGE);
-    Serial.printf("ADC_RESOLUTION:  %f\n", ADC_RESOLUTION);
-    Serial.printf("U_DEVIDER:       %f\n", U_DEVIDER);
-    Serial.printf("adcCorrection:   %f\n", adcCorrection);
-    Serial.printf("without corr.:   %1.1f\n", ((((float)rawVoltage * ADC_MAX_VOLTAGE) / ADC_RESOLUTION) * U_DEVIDER) );
-    #endif
-    busvoltage = ((((float)rawVoltage * ADC_MAX_VOLTAGE) / ADC_RESOLUTION) * U_DEVIDER) + adcCorrection;
-    if( rawVoltage == 1024 ) {
-      Serial.println("rawVoltage == 1024 -> seems to be USB voltage of 5V");
-      busvoltage = 5.0;
-    }
-  #else
+  if( max_init )
     busvoltage = fuelGauge.getVoltage();
-  #endif
+  else
+    busvoltage = 0.0;
   Serial.printf("busvoltage: %1.2f\n", busvoltage);
   do_publish = true;
   return busvoltage;
+}
+
+float getSOC() {
+  return fuelGauge.getSOC();
+}
+
+float getChangeRate() {
+  return fuelGauge.getChangeRate();
 }
 
 bool getSensorData() {
@@ -308,10 +304,14 @@ bool getJSON() {
   doc["voltage"] = voltageTemp;
   doc["clientcounter"] = clientCounter;
   doc["publishcounter"] = publishCounter;
+  doc["charging"] = (isCharging()?"true":"false");
+  doc["soc"] = String(getSOC());
+  doc["chgrate"] = String(getChangeRate());
+  doc["chgpin"] = String(digitalRead(CHARGE_PIN));
   serializeJson(doc, json);
+  Serial.printf("doc size: %d json size: %d\n", sizeof(doc), sizeof(json));
 
-  Serial.print( "getJSON() status: " );
-  Serial.println( status );
+  Serial.printf( "getJSON() status: %d\n", status );
   return status;
 }
 
@@ -361,20 +361,6 @@ void writeFile(const char * path, const char * message){
   file.close();
 }
 
-bool getWiFiManager() {
-  if( digitalRead(MANAGER_PIN) == 0 ) {
-    return true;
-  }
-  return false;
-}
-
-bool getReset() {
-  if( digitalRead(RESET_PIN) == 0 ) {
-    return true;
-  }
-  return false;
-}
-
 // Search for parameter in HTTP POST request
 const char* PARAM_INPUT_1 = "ssid";
 const char* PARAM_INPUT_2 = "pass";
@@ -383,6 +369,7 @@ const char* PARAM_INPUT_4 = "nodeid";
 const char* PARAM_INPUT_5 = "adccorrection";
 const char* PARAM_INPUT_6 = "sleepduration";
 const char* PARAM_INPUT_7 = "tempcorrection";
+const char* PARAM_INPUT_8 = "timezone";
 
 String webServerProcessor(const String& var) {
   Serial.printf("webServerProcessor(\"%s\")\n", var.c_str());
@@ -407,10 +394,6 @@ String webServerProcessor(const String& var) {
     Serial.printf("NODEID: %d\n", nodeId);
     return String(nodeId);
   }
-  if (var == "ADCCORRECTION"){
-    Serial.printf("ADCCORRECTION: %f\n", adcCorrection);
-    return String(adcCorrection);
-  }
   if (var == "TEMPCORRECTION"){
     Serial.printf("TEMPCORRECTION: %f\n", tempCorrection);
     return String(tempCorrection);
@@ -418,6 +401,10 @@ String webServerProcessor(const String& var) {
   if (var == "SLEEPDURATION"){
     Serial.printf("SLEEPDURATION: %d\n", sleepDuration);
     return String(sleepDuration);
+  }
+  if (var == "TIMEZONE"){
+    Serial.printf("TIMEZONE: %s\n", myTimeZone.c_str());
+    return String(myTimeZone);
   }
   return String();
 }
@@ -436,13 +423,15 @@ void startWiFiManager() {
   Serial.print("AP IP address: ");
   Serial.println(IP); 
 
+  dnsServer.start(DNS_PORT, "*", IP);
+
   // Web Server Root URL
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     Serial.println("server.on(\"/\", HTTP_GET, ...)");
     request->send(LittleFS, "/wifimanager.html", "text/html", false, webServerProcessor);
   });
 
-  server.serveStatic("/", LittleFS, "/");
+  server.serveStatic("/", LittleFS, "/wifimanager.html");
 
   server.on("/", HTTP_POST, [](AsyncWebServerRequest *request) {
     Serial.println("server.on(\"/\", HTTP_POST, ...)");
@@ -478,13 +467,6 @@ void startWiFiManager() {
           // Write file to save value
           writeFile(idPath, String(nodeId).c_str());
         }
-        // HTTP POST adcCorrection value
-        if (p->name() == PARAM_INPUT_5) {
-          adcCorrection = p->value().toFloat();
-          Serial.printf("adcCorrection set to: %f\n", adcCorrection);
-          // Write file to save value
-          writeFile(adcPath, String(adcCorrection).c_str());
-        }
         // HTTP POST sleepduration value
         if (p->name() == PARAM_INPUT_6) {
           sleepDuration = p->value().toInt();
@@ -499,13 +481,20 @@ void startWiFiManager() {
           // Write file to save value
           writeFile(tempPath, String(tempCorrection).c_str());
         }
+        // HTTP POST timezone value
+        if (p->name() == PARAM_INPUT_8) {
+          myTimeZone = p->value().c_str();
+          Serial.printf("timezone set to: %s\n", myTimeZone.c_str());
+          // Write file to save value
+          writeFile(timePath, myTimeZone.c_str());
+        }
       }
     }
     request->send(200, "text/plain", "Done. ESP will restart");
     delay(3000);
     ESP.restart();
   });
-  server.begin();
+  //server.begin();
   Serial.println("start WiFiManager finished");
 }
 
@@ -518,7 +507,7 @@ bool initWiFi() {
         Serial.println("start WifiManager via PIN");
         return false;
     }
-    // if( getReset() ){
+    // if( getPublish() ){
     //     Serial.println("start WifiManager via Reset PIN");
     //     deleteFile(ssidPath);
     //     deleteFile(passPath);
@@ -541,6 +530,7 @@ void setup() {
   Serial.begin(115200);
   delay(10);
   Serial.println("");
+  Serial.println("------------- SETUP started -------------");
 
   #ifdef ESP32
     Serial.println();
@@ -592,20 +582,19 @@ void setup() {
 
   // read existing files
   ssid = readFile(ssidPath);
-  Serial.println(ssid);
+  Serial.printf("SSID: %s\n", ssid.c_str());
   pass = readFile(passPath);
-  Serial.println(pass);
+  Serial.printf("PW: %s\n", pass.c_str());
   mqtt_server = readFile(mqttPath);
-  Serial.println(mqtt_server);
+  Serial.printf("MQTT Server: %s\n", mqtt_server.c_str());
   nodeId = readFile(idPath).toInt();
-  Serial.println(nodeId);
-  adcCorrection = readFile(adcPath).toFloat();
-  Serial.println(adcCorrection);
+  Serial.printf("NodeID: %d\n", nodeId);
   tempCorrection = readFile(tempPath).toFloat();
-  Serial.println(tempCorrection);
+  Serial.printf("Temp. correction: %f\n", tempCorrection);
   sleepDuration = readFile(sleepPath).toInt();
-  Serial.println(sleepDuration);
-  //getVoltage();
+  Serial.printf("sleep duration: %dus (%ds)\n", sleepDuration, sleepDuration/1000/1000);
+  myTimeZone = readFile(timePath);
+  Serial.printf("timezone: %s\n", myTimeZone.c_str());
 
   sprintf(WEATHERNODE, "WeatherNode%d", nodeId);
   Serial.println(WEATHERNODE);
@@ -614,13 +603,105 @@ void setup() {
   i2cScanner();
   
   Serial.println("init MAX1704x");
+  fuelGauge.enableDebugging();
   max_init = fuelGauge.begin();
   if( !max_init ) {
     Serial.println("error init MAX1704x");
+  } else {
+    Serial.println(F("Resetting the MAX17048..."));
+    delay(1000); // Give it time to get its act back together
+    // Read and print the reset indicator
+    Serial.print(F("Reset Indicator was: "));
+    bool RI = fuelGauge.isReset(true); // Read the RI flag and clear it automatically if it is set
+    Serial.println(RI); // Print the RI
+
+    // If RI was set, check it is now clear
+    if (RI)
+    {
+      Serial.print(F("Reset Indicator is now: "));
+      RI = fuelGauge.isReset(); // Read the RI flag
+      Serial.println(RI); // Print the RI    
+    }
+
+    // Read and print the device ID
+    Serial.print(F("Device ID: 0x"));
+    uint8_t id = fuelGauge.getID(); // Read the device ID
+    if (id < 0x10) Serial.print(F("0")); // Print the leading zero if required
+    Serial.println(id, HEX); // Print the ID as hexadecimal
+
+    // Read and print the device version
+    Serial.print(F("Device version: 0x"));
+    uint8_t ver = fuelGauge.getVersion(); // Read the device version
+    if (ver < 0x10) Serial.print(F("0")); // Print the leading zero if required
+    Serial.println(ver, HEX); // Print the version as hexadecimal
+
+    // Read and print the battery threshold
+    Serial.print(F("Battery empty threshold is currently: "));
+    Serial.print(fuelGauge.getThreshold());
+    Serial.println(F("%"));
+
+    // We can set an interrupt to alert when the battery SoC gets too low.
+    // We can alert at anywhere between 1% and 32%:
+    fuelGauge.setThreshold(20); // Set alert threshold to 20%.
+
+    // Read and print the battery empty threshold
+    Serial.print(F("Battery empty threshold is now: "));
+    Serial.print(fuelGauge.getThreshold());
+    Serial.println(F("%"));
+
+    // Read and print the high voltage threshold
+    Serial.print(F("High voltage threshold is currently: "));
+    float highVoltage = ((float)fuelGauge.getVALRTMax()) * 0.02; // 1 LSb is 20mV. Convert to Volts.
+    Serial.print(highVoltage, 2);
+    Serial.println(F("V"));
+
+    // Set the high voltage threshold
+    fuelGauge.setVALRTMax((float)4.1); // Set high voltage threshold (Volts)
+
+    // Read and print the high voltage threshold
+    Serial.print(F("High voltage threshold is now: "));
+    highVoltage = ((float)fuelGauge.getVALRTMax()) * 0.02; // 1 LSb is 20mV. Convert to Volts.
+    Serial.print(highVoltage, 2);
+    Serial.println(F("V"));
+
+    // Read and print the low voltage threshold
+    Serial.print(F("Low voltage threshold is currently: "));
+    float lowVoltage = ((float)fuelGauge.getVALRTMin()) * 0.02; // 1 LSb is 20mV. Convert to Volts.
+    Serial.print(lowVoltage, 2);
+    Serial.println(F("V"));
+
+    // Set the low voltage threshold
+    fuelGauge.setVALRTMin((float)3.9); // Set low voltage threshold (Volts)
+
+    // Read and print the low voltage threshold
+    Serial.print(F("Low voltage threshold is now: "));
+    lowVoltage = ((float)fuelGauge.getVALRTMin()) * 0.02; // 1 LSb is 20mV. Convert to Volts.
+    Serial.print(lowVoltage, 2);
+    Serial.println(F("V"));
+
+    // Read and print the HIBRT Active Threshold
+    Serial.print(F("Hibernate active threshold is: "));
+    float actThr = ((float)fuelGauge.getHIBRTActThr()) * 0.00125; // 1 LSb is 1.25mV. Convert to Volts.
+    Serial.print(actThr, 5);
+    Serial.println(F("V"));
+
+    // Read and print the HIBRT Hibernate Threshold
+    Serial.print(F("Hibernate hibernate threshold is: "));
+    float hibThr = ((float)fuelGauge.getHIBRTHibThr()) * 0.208; // 1 LSb is 0.208%/hr. Convert to %/hr.
+    Serial.print(hibThr, 3);
+    Serial.println(F("%/h"));
   }
 
   Serial.println("init BME280");
-
+  Adafruit_I2CDevice *i2c_dev = new Adafruit_I2CDevice(BME280_ADDRESS_ALTERNATE, &Wire);
+  if (!i2c_dev->begin())
+    Serial.println("i2c_dev begin() faulty");
+  else
+    Serial.println("i2c_dev begin ok");
+  uint8_t buffer[1];
+  buffer[0] = uint8_t(BME280_REGISTER_CHIPID);
+  i2c_dev->write_then_read(buffer, 1, buffer, 1);
+  Serial.printf("BME280_REGISTER_CHIPID: 0x%02X should be 0x60\n", buffer[0]);
   bmp_init = bmp.begin(BME280_ADDRESS_ALTERNATE);
   Serial.printf("bme280(BME280_ADDRESS_ALTERNATE) init: %s\n", bmp_init ? "TRUE" : "FALSE");
   if( !bmp_init ) {
@@ -637,13 +718,16 @@ void setup() {
   }
   if( bmp_init ) {
     Serial.println("config BME280");
-    bmp.setSampling(Adafruit_BME280::MODE_FORCED,
-                    Adafruit_BME280::SAMPLING_X1, // temperature
-                    Adafruit_BME280::SAMPLING_X1, // pressure
-                    Adafruit_BME280::SAMPLING_X1, // humidity
-                    Adafruit_BME280::FILTER_OFF,
-                    Adafruit_BME280::STANDBY_MS_1000);  
+    // bmp.setSampling(Adafruit_BME280::MODE_FORCED,
+    //                 Adafruit_BME280::SAMPLING_X1, // temperature
+    //                 Adafruit_BME280::SAMPLING_X1, // pressure
+    //                 Adafruit_BME280::SAMPLING_X1, // humidity
+    //                 Adafruit_BME280::FILTER_OFF,
+    //                 Adafruit_BME280::STANDBY_MS_1000);  
+    bmp.setSampling();
 
+    Serial.println("wait for 2 seconds to warm up sensor");
+    delay(2000);
     bmp.takeForcedMeasurement();
     Serial.printf("readPressure: %fhPa\n", bmp.readPressure()/100);
     Serial.printf("readHumidity: %f%%\n", bmp.readHumidity());
@@ -652,12 +736,23 @@ void setup() {
   }
 
   pinMode(MANAGER_PIN, INPUT_PULLUP);
-  pinMode(RESET_PIN, INPUT_PULLUP);
-  Serial.printf("MANAGER_PIN: %d\n", digitalRead(MANAGER_PIN));
-  Serial.printf("RESET_PIN:   %d\n", digitalRead(RESET_PIN));
-  
-  Serial.printf("Voltage = %f\n", fuelGauge.getVoltage());
-  Serial.printf("Battery Percentage %f\n", fuelGauge.getSOC());
+  pinMode(PUBLISH_PIN, INPUT_PULLUP);
+  pinMode(CHARGE_PIN, INPUT_PULLUP);
+
+  Serial.printf("MANAGER_PIN:       %d\n", digitalRead(MANAGER_PIN));
+  Serial.printf("getWifiManager():  %d\n", getWiFiManager());
+  Serial.printf("PUBLISH_PIN:       %d\n", digitalRead(PUBLISH_PIN));
+  Serial.printf("getPublish():      %d\n", getPublish());
+  Serial.printf("CHARGE_PIN:        %d\n", digitalRead(CHARGE_PIN));
+  Serial.printf("isCharging()():    %d\n", isCharging());
+  if( max_init )
+    Serial.printf("Voltage:           %1.2f\n", fuelGauge.getVoltage());
+  else
+    Serial.println("MAX1704x init failed no voltage info");
+  if( max_init && !isCharging() )
+    Serial.printf("Battery Percentage %f\n", fuelGauge.getSOC());
+  else if( !max_init )
+    Serial.println("MAX1704x init failed no State Of Charging (SOC) info");
 
   // Connecting to WiFi network
   if( initWiFi() ) {
@@ -690,14 +785,34 @@ void setup() {
     Serial.println("WiFi connected");
 
     // Printing the ESP IP address
-    Serial.println(WiFi.localIP());
+    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
 
     //init and get the time
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    Serial.printf("NTP server: %s\n", ntpServer);
+    Serial.printf("Timezone: %s\n", myTimeZone.c_str());
+    //configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    setTZ(myTimeZone.c_str());
+    configTime(myTimeZone.c_str(), ntpServer);
+    time(&now);
+    tm tm;
+    localtime_r(&now, &tm);
+    Serial.printf("Timestamp: %lld\n", now );
+    Serial.printf("Date: %02d.%02d.%04d %02d:%02d:%02d (DST=%d)\n", tm.tm_mday, tm.tm_mon+1, tm.tm_year+1900, tm.tm_hour, tm.tm_min, tm.tm_sec, tm.tm_isdst );
+    setTZ(myTimeZone.c_str());
+    localtime_r(&now, &tm);
+    Serial.printf("Timestamp: %lld\n", now );
+    Serial.printf("Date: %02d.%02d.%04d %02d:%02d:%02d (DST=%d)\n", tm.tm_mday, tm.tm_mon+1, tm.tm_year+1900, tm.tm_hour, tm.tm_min, tm.tm_sec, tm.tm_isdst );
     
     //char buf[50];
     //mqtt_server.toCharArray(buf, 50);
     client.setServer(mqtt_server.c_str(), 1883);
+    client.setBufferSize(512);
+
+    server.serveStatic("/", LittleFS, "/wifimanager.html");
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+      Serial.println("server.on(\"/\", HTTP_GET, ...)");
+      request->send(LittleFS, "/wifimanager.html", "text/html", false, webServerProcessor);
+    });
   }
   else {
     //Serial.println("deleting WiFi config files");
@@ -707,100 +822,105 @@ void setup() {
   }
   // wifi_set_sleep_type(LIGHT_SLEEP_T);
 
+  //setup the updateServer with credentials
+  //updateServer.setup(&server, "/update", "admin", "admin");
+  server.begin();
+
+  Serial.println("------------- SETUP finished -------------");
 }
 
 int rawVoltageLastValue = 0;
+time_t lastPublish = 0;
 
 // runs over and over again
 void loop() {
+  dnsServer.processNextRequest();
   if( WiFi.getMode() ==  WIFI_STA ) {
-    if (!client.connected()) {
-        reconnectMqtt();
-    }
-    client.loop();
-
     time(&now);
-    tm tm;
-    localtime_r(&now, &tm);
-    char res[32];
-    sprintf(res, "%02d.%02d.%04d %02d:%02d:%02d", tm.tm_mday, tm.tm_mon, tm.tm_year, tm.tm_hour, tm.tm_min, tm.tm_sec);
-
-    Serial.println( now );
-    Serial.println( res );
     
-    bool status = getJSON();
-    Serial.printf("Publish to topic: %s\n", mqtt_topic);
-    Serial.printf("Publish message: %s\n", json);
-    Serial.println(sizeof(json));
-    if( status == true ) {
-      if( do_publish ) {
-        if ( client.publish(mqtt_topic, json, false) == true ) {
-          Serial.println("succcess");
-          delay(1000);
-          client.disconnect();
-        #ifdef DO_DEEPSLEEP    
-          Serial.printf("go to deep sleep for %ds\n", sleepDuration/(1000*1000));
+    //if( now > lastPublish + (sleepDuration/1000/1000) ) {
+      if (!client.connected()) {
+          reconnectMqtt();
+      }
+      client.loop();
+
+      tm tm;
+      localtime_r(&now, &tm);
+      Serial.printf("\nTimestamp: %lld\n", now );
+      Serial.printf("Date: %02d.%02d.%04d %02d:%02d:%02d (DST=%d)\n", tm.tm_mday, tm.tm_mon+1, tm.tm_year+1900, tm.tm_hour, tm.tm_min, tm.tm_sec, tm.tm_isdst );
+
+      bool status = getJSON();
+      Serial.printf("Publish to topic: %s\n", mqtt_topic);
+      Serial.printf("Publish message: %s\n", json);
+      Serial.println(sizeof(json));
+      if( status == true ) {
+        if( do_publish && !getPublish() ) {
+          if ( client.publish(mqtt_topic, json, false) == true ) {
+            Serial.println("succcess");
+            delay(1000);
+            client.disconnect();
+            // store last publish time
+            //time(&lastPublish);
+            #ifdef DO_DEEPSLEEP    
+              Serial.printf("go to deep sleep for %ds\n", sleepDuration/(1000*1000));
+              #ifdef ESP32
+                esp_sleep_enable_timer_wakeup(sleepDuration);
+                esp_deep_sleep_start();
+              #else
+                ESP.deepSleep(sleepDuration, WAKE_RF_DEFAULT);
+                //Serial.printf("no not deep sleep but do not request new data for the next %d seconds\n", sleepDuration/1000/1000/60);
+              #endif
+            #else
+              Serial.println("delay for 1000ms");
+              delay(1000);
+            #endif
+          } else {
+            Serial.println("publish failed");
+            delay(1000);
+            publishCounter++;
+            ESP.restart();
+          }
+          //Serial.print("do publish to: ");
+          //Serial.println(WEATHERNODE);
+          //Serial.println(json);
+          //client.disconnect();
+        }
+        else {
+          if( !getPublish() )
+            Serial.println("publish not done due to failed HW init");
+          else
+            Serial.println("publish not done due to DO_PUBLISH SWITCH");
+          Serial.printf("go to deep sleep for rebooting %ds\n", sleepDuration/(1000*1000)); 
           #ifdef ESP32
-            esp_sleep_enable_timer_wakeup(DEEPSLEEPDURATION);
+            esp_sleep_enable_timer_wakeup(sleepDuration);
+            esp_sleep_pd_config(ESP_PD_DOMAIN_MAX, ESP_PD_OPTION_OFF);
+            esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
+            esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_OFF);
+            esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_OFF);
             esp_deep_sleep_start();
           #else
+            #ifdef MAX1704x
+              if( max_init )
+                fuelGauge.sleep();
+              else
+                Serial.println("MAX1704x init failed, no sleep for it");
+            #endif
             ESP.deepSleep(sleepDuration, WAKE_RF_DEFAULT);
+            //Serial.printf("no not deep sleep but do not request new data for the next %d seconds\n", sleepDuration/1000/1000/60);
           #endif
-        #else
-          Serial.println("delay for 1000ms");
-          delay(1000);
-        #endif
-        } else {
-          Serial.println("publish failed");
-          delay(1000);
-          publishCounter++;
-          ESP.restart();
         }
-        Serial.print("do publish to: ");
-        Serial.println(WEATHERNODE);
-        Serial.println(json);
-        client.disconnect();
-      /*
-      #ifdef DO_DEEPSLEEP    
-        Serial.print("go to deep sleep for "); 
-        Serial.print(DEEPSLEEPDURATION/(1000*1000));
-        Serial.println("s");
-        //esp_sleep_enable_timer_wakeup( DEEPSLEEPDURATION );
-        //esp_deep_sleep_start();
-        //ESP.deepSleep(DEEPSLEEPDURATION, WAKE_RF_DEFAULT);
-        #ifdef ESP32
-          esp_sleep_enable_timer_wakeup(DEEPSLEEPDURATION);
-          esp_deep_sleep_start();
-        #else
-          ESP.deepSleep(DEEPSLEEPDURATION, WAKE_RF_DEFAULT);
-        #endif
-      #else
-        Serial.println("delay for 1000ms");
-        delay(1000);
-      #endif
-      */
+      } else {
+          Serial.println("status != true");
+          delay(1000);
       }
-      else {
-        Serial.println("publish not done due to failed HW init");
-        Serial.printf("go to deep sleep for rebooting %ds\n", DEEPSLEEPDURATION/(1000*1000)); 
-        #ifdef ESP32
-          esp_sleep_enable_timer_wakeup(DEEPSLEEPDURATION);
-          esp_sleep_pd_config(ESP_PD_DOMAIN_MAX, ESP_PD_OPTION_OFF);
-          esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
-          esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_OFF);
-          esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_OFF);
-          esp_deep_sleep_start();
-        #else
-          #ifdef MAX1704x
-            fuelGauge.sleep();
-          #endif
-          ESP.deepSleep(DEEPSLEEPDURATION, WAKE_RF_DEFAULT);
-        #endif
-      }
-    } else {
-        Serial.println("status != true");
-        delay(1000);
-    }
+    // } else if( now > lastPublish ) {
+    //   tm tm, tml;
+    //   localtime_r(&now, &tm);
+    //   localtime_r(&lastPublish, &tml);
+    //   Serial.printf("Date: %02d.%02d.%04d %02d:%02d:%02d (DST=%d) last publish %02d.%02d.%04d %02d:%02d:%02d (DST=%d) wait for %ds\r", 
+    //     tm.tm_mday, tm.tm_mon+1, tm.tm_year+1900, tm.tm_hour, tm.tm_min, tm.tm_sec, tm.tm_isdst,
+    //     tml.tm_mday, tml.tm_mon+1, tml.tm_year+1900, tml.tm_hour, tml.tm_min, tml.tm_sec, tml.tm_isdst,(sleepDuration/1000/1000) );
+    // }
   }
   else {
     #ifdef DEBUG
@@ -812,8 +932,12 @@ void loop() {
         }
         Serial.printf("without corr.: %1.1f busvoltage: %1.1f\n", ((((float)rawVoltage * ADC_MAX_VOLTAGE) / ADC_RESOLUTION) * U_DEVIDER), ((((float)rawVoltage * ADC_MAX_VOLTAGE) / ADC_RESOLUTION) * U_DEVIDER) + adcCorrection);
       #else
-        Serial.printf("Voltage = %f\n", fuelGauge.getVoltage());
-        Serial.printf("Battery Percentage %f\n", fuelGauge.getSOC());
+        if( max_init ) {
+          Serial.printf("Voltage = %f\n", fuelGauge.getVoltage());
+          Serial.printf("Battery Percentage %f\n", fuelGauge.getSOC());
+        }
+        else
+          Serial.println("MAX1704x init failed, no info about anything");
       #endif
     #endif
   }
