@@ -56,4 +56,9 @@ After taking the measurement it creates a JSON package and sends it to the MQTT 
 
 If transmission of packet is successful it goes to a deep sleep for 15 minutes and the cycle begins again with a restart of the node.
 
+## Housing
 
+In the folder Box is a construction for a box for the WeatherNode including space for a 18650 battery.
+
+![image info](./pictures/Box1.jpg)
+![image info](./pictures/Box2.jpg)
