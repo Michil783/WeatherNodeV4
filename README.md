@@ -4,6 +4,7 @@ WeatherNode is a small HW device based on ESP8266 to capture actual weather cond
 The data is send via Wifi to a MQTT broker.
 The back office SW is stored in https://github.com/Michil783/Store_MQTT_Data_in_Database
 for the MQTT to DB service and in https://github.com/Michil783/dhtWebHist for a web interface to access the DB content.
+Both applications could run on a Raspberry Pi together with the MQTT broker.
 
 ## Hardware
 
